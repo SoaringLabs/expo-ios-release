@@ -1,0 +1,6 @@
+interface:
+  display_name: "Expo iOS Release"
+  short_description: "Prepare and resume EAS, App Review, and GitHub releases"
+  default_prompt: "Use $expo-ios-release to prepare or execute the specified iOS version release, verify the exact build and source, and report Apple and GitHub results separately."
+policy:
+  allow_implicit_invocation: true
