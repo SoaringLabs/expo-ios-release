@@ -114,6 +114,20 @@ class ConfigurationTest(unittest.TestCase):
         self.assertEqual(release.checks(self.fixture.path, self.fixture.remote)["status"], "passed")
         self.assertFalse(any("check:motion" in a for a in self.fixture.remote.calls))
 
+    def test_notes_adapter_must_be_an_argument_array(self):
+        for value in ["node validator.mjs", [], ["node", ""]]:
+            self.write_config(notes_adapter=value)
+            with self.subTest(value=value), self.assertRaisesRegex(release.Blocked, "notes_adapter"):
+                release.project_config(self.root)
+
+    def test_project_notes_validation_precedes_candidate_remote_probes(self):
+        import sys
+        self.write_config(notes_adapter=[sys.executable, "-c", "import sys;sys.exit(2)"])
+        self.fixture.remote.calls.clear()
+        with self.assertRaisesRegex(release.Blocked, "adapter rejected"):
+            self.fixture.pipeline().candidate()
+        self.assertEqual(self.fixture.remote.calls, [])
+
     def test_shell_command_strings_are_rejected(self):
         self.write_config(checks=["pnpm lint && echo success"])
         with self.assertRaisesRegex(release.Blocked, "argument arrays"):
