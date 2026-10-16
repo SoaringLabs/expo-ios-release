@@ -11,7 +11,7 @@ def main():
     root = Path(__file__).resolve().parents[1]
     skill = root / "skills/expo-ios-release"
     errors = []
-    required = ["SKILL.md", "agents/openai.yaml", "scripts/release.py", "scripts/changelog.py",
+    required = ["SKILL.md", "agents/openai.yaml", "scripts/release.py", "scripts/changelog.py", "scripts/github_release.py",
                 "references/configuration.md", "references/execution.md", "references/github-release.md"]
     for name in required:
         if not (skill / name).is_file():
@@ -24,7 +24,7 @@ def main():
     if "$expo-ios-release" not in interface or "allow_implicit_invocation: true" not in interface:
         errors.append("Skill interface/invocation metadata differs")
     for path in root.rglob("*"):
-        if not path.is_file() or ".git" in path.relative_to(root).parts:
+        if not path.is_file() or ".git" in path.relative_to(root).parts or path.name == ".DS_Store":
             continue
         relative = str(path.relative_to(root))
         if "__pycache__" in path.parts or path.suffix in {".pyc", ".p8", ".p12", ".ipa"}:

@@ -24,8 +24,15 @@ class FakeNotesRemote:
         self.review = {"id": "review", "attributes": {"notes": "old review", "contactEmail": "review@example.invalid", "demoAccountRequired": True}}
         self.github = {"body": "old github", "tagName": "v9.9.9", "name": "ExampleApp v9.9.9", "isDraft": False, "isPrerelease": False}
         self.beta = {"id": "beta", "attributes": {"locale": "zh-Hans", "whatsNew": "old tests"}}
+        self.github_id = 321
 
     def run(self, argv, root):
+        if argv[:3] == ["git", "remote", "get-url"]:
+            return "https://github.com/example/ExampleApp.git"
+        if argv[:2] == ["gh", "api"]:
+            data = ({"id": 123, "full_name": "example/ExampleApp", "permissions": {"push": True}}
+                    if argv[-1] == "repos/example/ExampleApp" else {"id": self.github_id})
+            return "HTTP/2.0 200 OK\n\n" + json.dumps(data)
         if argv[:3] == ["asc", "versions", "list"]: return json.dumps({"data": [self.version]})
         if argv[:3] == ["asc", "localizations", "list"]: return json.dumps({"data": [self.locale]})
         if argv[:3] == ["asc", "review", "details-for-version"]: return json.dumps({"data": self.review})
@@ -66,7 +73,7 @@ class ChangelogTest(unittest.TestCase):
             if args[0] == "ls-remote": return "a" * 40 + "\trefs/tags/v9.9.9^{}"
             raise AssertionError(args)
         self.helpers = {"state_path": lambda root, version: self.state, "now": release.now,
-                        "atomic_json": release.atomic_json, "app_id": "1000000001", "git": git}
+                        "atomic_json": release.atomic_json, "app_id": "1000000001", "git": git, "github": release.github_release}
 
     def sync(self, execute=True, channels=None):
         return notes.remote_notes(self.root, self.directory, self.manifest, channels or ["asc", "github"], execute, self.remote, self.helpers)
@@ -75,6 +82,50 @@ class ChangelogTest(unittest.TestCase):
         self.assertEqual(notes.parse("Improved search.\n\nFixed calendar scrolling.")["body"], "Improved search.\n\nFixed calendar scrolling.")
         for text in ("", "TODO", "TBD", "x" * 4001):
             with self.subTest(text=text[:8]), self.assertRaises(notes.NotesError): notes.parse(text)
+
+    def test_pending_publication_and_apple_writes_block_notes_mutations(self):
+        for name in ("github", "state"):
+            path = self.state.with_name(name + ".json")
+            previous = path.read_bytes() if path.exists() else None
+            release.atomic_json(path, {"pending": {"operation": "release:create" if name == "github" else "review"}})
+            with self.subTest(name=name), self.assertRaisesRegex(release.github_release.GitHubUncertain, "pending"):
+                self.sync(channels=["github"])
+            self.assertEqual(self.remote.writes, [])
+            if previous is None:
+                path.unlink()
+            else:
+                path.write_bytes(previous)
+
+    def test_notes_sync_refreshes_current_publication_hash_and_keeps_original(self):
+        original = notes.body_digest("old github")
+        path = self.state.with_name("github.json")
+        release.atomic_json(path, {"schema": 1, "status": "verified", "publication_body_sha256": original,
+            "intent": {"repository": "example/ExampleApp", "source_commit": self.manifest["source_commit"],
+                       "tag": "v9.9.9", "body_sha256": original}})
+        self.assertEqual(self.sync(channels=["github"])["status"], "verified")
+        journal = release.read_json(path)
+        self.assertEqual(journal["intent"]["body_sha256"], notes.body_digest(BODY))
+        self.assertEqual(journal["publication_body_sha256"], original)
+        self.assertEqual(journal["notes_history"][0]["body_sha256"], original)
+        self.sync(channels=["github"])
+        self.assertEqual(len(release.read_json(path)["notes_history"]), 1)
+
+    def test_notes_sync_preserves_a_conflicting_publication_binding(self):
+        path = self.state.with_name("github.json")
+        release.atomic_json(path, {"schema": 1, "intent": {"repository": "other/Repository"}})
+        before = path.read_bytes()
+        with self.assertRaisesRegex(notes.NotesError, "journal differs"):
+            self.sync(channels=["github"])
+        self.assertEqual(self.remote.writes, [])
+        self.assertEqual(path.read_bytes(), before)
+
+    def test_recreated_release_cannot_replace_publication_identity_during_notes_sync(self):
+        release.atomic_json(self.state.with_name("github.json"), {"schema": 1, "release_id": 999,
+            "intent": {"repository": "example/ExampleApp", "repository_id": 123,
+                       "source_commit": self.manifest["source_commit"], "tag": "v9.9.9"}})
+        with self.assertRaisesRegex(notes.NotesError, "Release ID changed"):
+            self.sync(channels=["github"])
+        self.assertEqual(self.remote.writes, [])
 
     def test_generate_is_repeatable_and_keeps_review_details(self):
         initial = {p: p.read_bytes() for p in self.directory.rglob("*") if p.is_file()}

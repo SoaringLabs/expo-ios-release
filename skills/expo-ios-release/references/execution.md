@@ -4,17 +4,23 @@
 
 ```bash
 python3 "$HELPER" doctor --root "$ROOT"
+python3 "$HELPER" doctor --root "$ROOT" --through github
 python3 "$HELPER" status --root "$ROOT"
+python3 "$HELPER" status --manifest "$PATH"
 python3 "$HELPER" prepare --root "$ROOT" --version VERSION --base-ref PREVIOUS_SOURCE --locales en-US
 python3 "$HELPER" notes-generate --root "$ROOT" --version VERSION
 python3 "$HELPER" notes-check --root "$ROOT" --version VERSION
-python3 "$HELPER" plan --manifest "$PATH"
+python3 "$HELPER" plan --manifest "$PATH" --through github
 python3 "$HELPER" candidate --manifest "$PATH"
 python3 "$HELPER" checks --manifest "$PATH"
-python3 "$HELPER" run --manifest "$PATH" --execute --through review
+python3 "$HELPER" run --manifest "$PATH" --execute --through github
 ```
 
-These are a workflow reference, not a blindly replayed batch. Commit the intended source/config/version/notes before `candidate`; it resets candidate evidence. `checks` records actual exit codes and hashed evidence. Missing scope README or unresolved manifests block preparation. `run` without `--execute` and `plan` are offline; `doctor`, `status`, adoption and candidate recovery may read remote services. `checks` runs the project's configured commands, which may have their own effects.
+These are a workflow reference, not a blindly replayed batch. Commit the intended source/config/version/notes before `candidate`; it resets candidate evidence. `checks` records actual exit codes and hashed evidence. Missing scope README or unresolved manifests block preparation. `run`/`github` without `--execute` and `plan` are offline; `doctor`, `status`, adoption and candidate recovery may read remote services. `checks` runs the project's configured commands, which may have their own effects.
+
+`run` and `plan` still default to `review`; existing Apple-only commands retain their scope and do not need `gh`. The standard complete release explicitly selects `--through github`. `doctor --through github` also checks GitHub repository access. The helper returns promptly for pending EAS/Apple processing; continue bounded polling with the same manifest and endpoint.
+
+`status --manifest PATH` reports the exact candidate, observed Apple/GitHub state, `requested_through`, `completed_through`, `overall_status`, pending operations and next action. It makes no remote writes and does not reconcile journals. Existing `status --root ROOT` retains the current live/TestFlight overview. `complete` always applies to the requested endpoint; completion through `review` is Apple-only.
 
 ## Evidence
 
@@ -32,12 +38,15 @@ Readiness blocks errors and actionable warnings. The sole conditional exception 
 
 Resolve the private Git directory with `git rev-parse --absolute-git-dir`. `expo-ios-release/VERSION/state.json` holds sanitized identities, source/config digests and mutation receipts, guarded by an exclusive lock and atomic writes. It stores no raw CLI responses, keys or signed download URLs. Each mutation is pending before dispatch; uncertain outcomes are never blindly replayed.
 
+The helper also owns `github.json` for tag/Release publication and `notes.json` for subsequent text updates. All three journals share the release lock. A pending write blocks other channels; the owning command reads back and reconciles its exact operation. Once a GitHub publication intent exists, `candidate` preserves its source binding and requires a new marketing version for a different source. Schema-2 manifests without GitHub records remain valid; publication reads existing remote resources before creating any missing ones.
+
 | Pending operation | Recovery |
 | --- | --- |
 | Build dispatch | Inspect exact candidate EAS builds and use `adopt --manifest PATH --build-id ID`; verify source/profile/app/version. It never adopts `latest`. |
 | Upload | Read the exact Apple marketing version/build and EAS worker status. Matching Apple Build completes upload; absence alone does not establish a failed request. |
 | `stage:create`, `stage:metadata`, `stage:attach`, `stage:notes`, `stage:strategy` | Read that operation's exact resource. Matching result completes only its receipt. A mismatch stays uncertain; inspect and complete supported remediation before resuming. |
 | Review | Read the bound Apple Version, attached Build and submitted state. WAITING_FOR_REVIEW/IN_REVIEW or verified later state completes it; a draft remains uncertain. |
+| `tag:create`, `tag:push`, `release:create` | Resume `github --manifest PATH --execute` or the complete endpoint. Matching local/remote resources reconcile only that operation; unknown absence remains uncertain. See [GitHub recovery](github-release.md). |
 
 `retry-upload --manifest PATH` requires a bound ERRORED/CANCELED submission, valid exact Build and no unresolved write. It archives the previous receipt and reuses the Build. If Apple already has it, upload is retained instead of repeated.
 
@@ -49,6 +58,6 @@ Source/config changes invalidate candidate evidence. Notes/strategy changes inva
 
 `notes-sync --root ROOT --version VERSION --channels asc github` previews existing-resource differences. `--execute` changes only notes and verifies identities plus non-note fields. TestFlight is an optional explicit channel. It needs exact existing Apple version/build checkpoints; GitHub readback proves the peeled tag matches `source_commit`.
 
-Notes writes have independent `notes.json` receipts, body hashes and remote target IDs. Lost responses reconcile through readback without duplicate writes. Changed body/target cannot overwrite a pending operation. Notes refresh does not confer full store acceptance or resubmit a review. Backend deployment and endpoint schemas are project-owned.
+Notes writes have independent `notes.json` receipts, body hashes and remote target IDs. Lost responses reconcile through readback without duplicate writes. Changed body/target cannot overwrite a pending operation. A verified GitHub notes update refreshes the publication journal's current body hash and preserves its publication hash/history. Notes refresh does not confer full store acceptance or resubmit a review. Backend deployment and endpoint schemas are project-owned.
 
 Exit codes are 0 for a successful/plan/pending result, 2 for blocked/differing inputs, and 3 for uncertain write outcomes. Read the returned `status` and `phase`; process success alone is not completion.

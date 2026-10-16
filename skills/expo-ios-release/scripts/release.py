@@ -18,9 +18,13 @@ _notes_spec = importlib.util.spec_from_file_location("expo_release_changelog", P
 changelog = importlib.util.module_from_spec(_notes_spec)
 _notes_spec.loader.exec_module(changelog)
 
+_github_spec = importlib.util.spec_from_file_location("expo_release_github", Path(__file__).with_name("github_release.py"))
+github_release = importlib.util.module_from_spec(_github_spec)
+_github_spec.loader.exec_module(github_release)
+
 CONFIG_NAME = ".expo-ios-release.json"
 TOOLS = {"eas": "22.4.0", "asc": "5.14.1"}
-STEPS = ["build", "upload", "stage", "review"]
+STEPS = ["build", "upload", "stage", "review", "github"]
 SUBMITTED = {"WAITING_FOR_REVIEW", "IN_REVIEW", "ACCEPTED", "PENDING_DEVELOPER_RELEASE",
              "PENDING_APPLE_RELEASE", "PROCESSING_FOR_DISTRIBUTION",
              "READY_FOR_DISTRIBUTION", "READY_FOR_SALE"}
@@ -37,9 +41,7 @@ class Uncertain(Blocked):
     pass
 
 
-class CommandFailure(Exception):
-    def __init__(self, code):
-        self.code = code
+CommandFailure = github_release.CommandFailure
 
 
 class Runner:
@@ -51,7 +53,7 @@ class Runner:
         result = subprocess.run(argv, cwd=root, env=env, capture_output=True,
                                 text=True, timeout=timeout)
         if result.returncode:
-            raise CommandFailure(result.returncode)
+            raise CommandFailure(result.returncode, result.stdout, result.stderr)
         return result.stdout.strip()
 
 
@@ -402,6 +404,78 @@ class Pipeline:
     def save(self):
         atomic_json(self.path, self.state)
 
+    def publisher(self):
+        return github_release.Publisher(self, {"atomic_json": atomic_json, "now": now, "notes": changelog})
+
+    def github_evidence(self):
+        """Verify a historical candidate without evaluating the current HEAD config."""
+        if self.state.get("pending"):
+            raise Uncertain("Reconcile the pending Apple write before GitHub publication")
+        if (self.state.get("source", {}).get("commit") != self.manifest["source_commit"] or
+                not all(self.state.get(k) for k in ("build_id", "version_id", "apple_build"))):
+            raise Blocked("Restore exact source/build/version checkpoints before GitHub publication")
+        config = project_config(self.root)
+        for tool in ("eas", "asc"):
+            output = self.runner.run([tool, "--version" if tool == "eas" else "version"], self.root)
+            actual = re.search(r"(?:eas-cli/)?(\d+\.\d+\.\d+)", output)
+            if not actual or actual[1] != config["tool_versions"][tool]:
+                raise Blocked(f"Require configured {tool} version for publication readback")
+        if not asc_auth(self.root, self.runner):
+            raise Blocked("Independent ASC authentication is missing")
+        apps = records(self.call("asc", "apps", "view", "--id", self.manifest["app_id"], "--output", "json"))
+        if len(apps) != 1 or apps[0].get("id") != self.manifest["app_id"] or attrs(apps[0]).get("bundleId") != self.manifest["bundle_id"]:
+            raise Blocked("Authenticated ASC app identity is unverified")
+        build = self.call("eas", "build:view", self.state["build_id"], "--json")
+        verify_build(build, self.manifest)
+        if build.get("status") != "FINISHED":
+            raise Blocked("GitHub publication requires the finished exact EAS Build")
+        apple, version = self.apple_build(build), self.version()
+        if (not apple or apple != self.state["apple_build"] or apple["processingState"] != "VALID" or
+                not version or version["id"] != self.state["version_id"] or linked(version, "build") != apple["id"] or
+                self.version_state(version) not in SUBMITTED):
+            raise Blocked("GitHub publication requires the exact formally submitted Apple version/build")
+        acceptance = read_json(self.directory / "acceptance.json")
+        evidence(self.root, acceptance, "code", self.manifest)
+        for group in ("artifact", "store"):
+            evidence(self.root, acceptance, group, self.manifest, build)
+        for group in ("production", "device"):
+            if self.manifest["acceptance_policy"][group] == "required":
+                evidence(self.root, acceptance, group, self.manifest, build if group == "device" else None)
+        notes, localizations, fingerprint = inputs(self.directory, self.manifest)
+        if acceptance["store"].get("metadata_digest") != fingerprint or not self.stage_matches(version, apple, notes, localizations):
+            raise Blocked("Store acceptance or submitted metadata differs from the publication inputs")
+        return self.version_state(version)
+
+    def github(self):
+        with locked(self.path):
+            self.state = read_json(self.path) if self.path.exists() else {"schema": 1}
+            return self._github_locked()
+
+    def _github_locked(self):
+        github_release.guard_writes(self.path.parent, allow="github")
+        apple_state = self.github_evidence()
+        self.state["requested_through"] = "github"
+        self.save()
+        published = self.publisher().publish()
+        return {"status": "complete", "through": "github", "requested_through": "github", "phase": "github", "apple_state": apple_state,
+            "version_id": self.state["version_id"], "github": published}
+
+    def run(self, through):
+        with locked(self.path):
+            self.state = read_json(self.path) if self.path.exists() else {"schema": 1}
+            if through == "github" and not self.state.get("pending") and (
+                    self.state.get("receipts", {}).get("review") or self.path.with_name("github.json").exists()):
+                return self._github_locked()
+            github_release.guard_writes(self.path.parent, allow="state")
+            self.state["requested_through"] = through
+            self.save()
+            if through == "github":
+                github_release.Client(self.root, self.runner).preflight()
+            result = self._run_apple_locked("review" if through == "github" else through)
+            if through == "github" and result.get("status") == "complete":
+                return self._github_locked()
+            return {**result, "requested_through": through}
+
     def mutate(self, operation, argv):
         self.state["pending"] = {"operation": operation, "started_at": now()}
         self.save()
@@ -567,6 +641,7 @@ class Pipeline:
     def adopt(self, build_id):
         with locked(self.path):
             self.state = read_json(self.path) if self.path.exists() else {"schema": 1}
+            github_release.guard_writes(self.path.parent, allow="state")
             candidate = local_preflight(self.root, self.manifest)
             if self.state.get("source") not in (None, candidate):
                 raise Blocked("Checkpoint source differs; use a new candidate")
@@ -587,6 +662,9 @@ class Pipeline:
     def candidate(self):
         with locked(self.path):
             self.state = read_json(self.path) if self.path.exists() else {"schema": 1}
+            github_release.guard_writes(self.path.parent, allow="state")
+            if self.path.with_name("github.json").exists():
+                raise Blocked("GitHub publication intent already binds this version; preserve its source and use a new version")
             if self.state.get("pending"):
                 raise Uncertain("Reconcile the previous write before creating another candidate")
             if not source_clean(self.root):
@@ -614,6 +692,7 @@ class Pipeline:
     def retry_upload(self):
         with locked(self.path):
             self.state = read_json(self.path) if self.path.exists() else {"schema": 1}
+            github_release.guard_writes(self.path.parent, allow="state")
             if self.state.get("pending"):
                 raise Uncertain("Reconcile an unknown outcome instead of retrying it")
             local_preflight(self.root, self.manifest)
@@ -636,129 +715,128 @@ class Pipeline:
             self.save()
             return {"status": "retry-prepared" if not apple else "upload-found", "remote_mutations": 0}
 
-    def run(self, through):
-        with locked(self.path):
-            self.state = read_json(self.path) if self.path.exists() else {"schema": 1}
-            candidate = local_preflight(self.root, self.manifest)
-            if self.state.get("source") not in (None, candidate):
-                raise Blocked("Checkpoint source/config changed; start a new candidate")
-            self.state["source"] = candidate
-            notes, localizations, fingerprint = inputs(self.directory, self.manifest) if through in ("stage", "review") else (None, None, None)
-            toolcheck(self.root, self.runner, require_asc=through != "build")
-            if through != "build" and not asc_auth(self.root, self.runner):
-                raise Blocked("Independent ASC authentication is missing; EAS managed access is separate")
-            if through != "build":
-                app_response = self.call("asc", "apps", "view", "--id", self.manifest["app_id"], "--output", "json")
-                app_records = records(app_response)
-                if len(app_records) != 1 or app_records[0].get("id") != self.manifest["app_id"] or attrs(app_records[0]).get("bundleId") != self.manifest["bundle_id"]:
-                    raise Blocked("Authenticated ASC app identity is unverified")
-            acceptance = read_json(self.directory / "acceptance.json")
-            # Responsibility policy is explicit and frozen in the manifest.
-            evidence(self.root, acceptance, "code", self.manifest)
-            if self.manifest["acceptance_policy"]["production"] == "required":
-                evidence(self.root, acceptance, "production", self.manifest)
-            pending = self.state.get("pending", {}).get("operation")
-            if pending == "build" and not self.state.get("build_id"):
-                raise Uncertain("Build dispatch unknown; inspect EAS and adopt the exact Build ID")
-            if not self.state.get("build_id"):
-                output = self.mutate("build", ["eas", "build", "--platform", "ios", "--profile",
-                    self.manifest["profile"], "--no-wait", "--non-interactive", "--json", "--freeze-credentials"])
-                try:
-                    builds = records(json.loads(output))
-                    if len(builds) != 1 or not builds[0].get("id"):
-                        raise ValueError()
-                    self.state["build_id"] = builds[0]["id"]
-                    self.done("build")
-                except (ValueError, KeyError):
-                    raise Uncertain("Build dispatch returned no unique ID; inspect EAS then adopt")
-            build = self.call("eas", "build:view", self.state["build_id"], "--json")
-            verify_build(build, self.manifest)
-            self.state["build"] = safe_build(build)
-            self.save()
-            if build["status"] != "FINISHED":
-                if build["status"] in ("ERRORED", "CANCELED"):
-                    raise Blocked("Candidate build failed; diagnose it before selecting a new candidate")
-                return {"status": "pending", "phase": "build", "build": safe_build(build)}
-            if through == "build":
-                return {"status": "complete", "through": "build", "build": safe_build(build)}
-            evidence(self.root, acceptance, "artifact", self.manifest, build)
-            apple = self.apple_build(build)
-            pending = self.state.get("pending", {}).get("operation")
-            if apple and pending == "upload":
-                self.done("upload")
-            if not apple:
-                if pending == "upload":
-                    raise Uncertain("Upload outcome unknown and Apple Build absent; inspect submission logs")
-                if not self.state.get("submission_id"):
+    def _run_apple_locked(self, through):
+        self.state = read_json(self.path) if self.path.exists() else {"schema": 1}
+        candidate = local_preflight(self.root, self.manifest)
+        if self.state.get("source") not in (None, candidate):
+            raise Blocked("Checkpoint source/config changed; start a new candidate")
+        self.state["source"] = candidate
+        notes, localizations, fingerprint = inputs(self.directory, self.manifest) if through in ("stage", "review") else (None, None, None)
+        toolcheck(self.root, self.runner, require_asc=through != "build")
+        if through != "build" and not asc_auth(self.root, self.runner):
+            raise Blocked("Independent ASC authentication is missing; EAS managed access is separate")
+        if through != "build":
+            app_response = self.call("asc", "apps", "view", "--id", self.manifest["app_id"], "--output", "json")
+            app_records = records(app_response)
+            if len(app_records) != 1 or app_records[0].get("id") != self.manifest["app_id"] or attrs(app_records[0]).get("bundleId") != self.manifest["bundle_id"]:
+                raise Blocked("Authenticated ASC app identity is unverified")
+        acceptance = read_json(self.directory / "acceptance.json")
+        # Responsibility policy is explicit and frozen in the manifest.
+        evidence(self.root, acceptance, "code", self.manifest)
+        if self.manifest["acceptance_policy"]["production"] == "required":
+            evidence(self.root, acceptance, "production", self.manifest)
+        pending = self.state.get("pending", {}).get("operation")
+        if pending == "build" and not self.state.get("build_id"):
+            raise Uncertain("Build dispatch unknown; inspect EAS and adopt the exact Build ID")
+        if not self.state.get("build_id"):
+            output = self.mutate("build", ["eas", "build", "--platform", "ios", "--profile",
+                self.manifest["profile"], "--no-wait", "--non-interactive", "--json", "--freeze-credentials"])
+            try:
+                builds = records(json.loads(output))
+                if len(builds) != 1 or not builds[0].get("id"):
+                    raise ValueError()
+                self.state["build_id"] = builds[0]["id"]
+                self.done("build")
+            except (ValueError, KeyError):
+                raise Uncertain("Build dispatch returned no unique ID; inspect EAS then adopt")
+        build = self.call("eas", "build:view", self.state["build_id"], "--json")
+        verify_build(build, self.manifest)
+        self.state["build"] = safe_build(build)
+        self.save()
+        if build["status"] != "FINISHED":
+            if build["status"] in ("ERRORED", "CANCELED"):
+                raise Blocked("Candidate build failed; diagnose it before selecting a new candidate")
+            return {"status": "pending", "phase": "build", "build": safe_build(build)}
+        if through == "build":
+            return {"status": "complete", "through": "build", "build": safe_build(build)}
+        evidence(self.root, acceptance, "artifact", self.manifest, build)
+        apple = self.apple_build(build)
+        pending = self.state.get("pending", {}).get("operation")
+        if apple and pending == "upload":
+            self.done("upload")
+        if not apple:
+            if pending == "upload":
+                raise Uncertain("Upload outcome unknown and Apple Build absent; inspect submission logs")
+            if not self.state.get("submission_id"):
+                result = self.call("eas", "submit:list", "--platform", "ios", "--limit", "50", "--json", "--non-interactive")
+                matches = [s for s in records(result) if (s.get("submittedBuild") or {}).get("id") == build["id"]
+                    and (s.get("iosConfig") or {}).get("ascAppIdentifier") == self.manifest["app_id"]
+                    and s.get("status") not in ("ERRORED", "CANCELED")]
+                if not matches:
+                    self.mutate("upload", ["eas", "submit", "--platform", "ios", "--profile", self.manifest["submit_profile"],
+                        "--id", build["id"], "--non-interactive", "--no-wait"])
                     result = self.call("eas", "submit:list", "--platform", "ios", "--limit", "50", "--json", "--non-interactive")
                     matches = [s for s in records(result) if (s.get("submittedBuild") or {}).get("id") == build["id"]
                         and (s.get("iosConfig") or {}).get("ascAppIdentifier") == self.manifest["app_id"]
                         and s.get("status") not in ("ERRORED", "CANCELED")]
-                    if not matches:
-                        self.mutate("upload", ["eas", "submit", "--platform", "ios", "--profile", self.manifest["submit_profile"],
-                            "--id", build["id"], "--non-interactive", "--no-wait"])
-                        result = self.call("eas", "submit:list", "--platform", "ios", "--limit", "50", "--json", "--non-interactive")
-                        matches = [s for s in records(result) if (s.get("submittedBuild") or {}).get("id") == build["id"]
-                            and (s.get("iosConfig") or {}).get("ascAppIdentifier") == self.manifest["app_id"]
-                            and s.get("status") not in ("ERRORED", "CANCELED")]
-                    if len(matches) != 1:
-                        raise Uncertain("Upload returned no unique matching submission; inspect EAS/Apple")
-                    self.state["submission_id"] = matches[0]["id"]
-                    self.done("upload")
-                submission = self.call("eas", "submit:view", self.state["submission_id"], "--json")
-                if (submission.get("submittedBuild") or {}).get("id") != build["id"] or (submission.get("iosConfig") or {}).get("ascAppIdentifier") != self.manifest["app_id"]:
-                    raise Blocked("EAS submission identity mismatch")
-                if submission.get("status") in ("ERRORED", "CANCELED"):
-                    raise Blocked("EAS upload failed; inspect cause and reuse this build after correction")
-                return {"status": "pending", "phase": "upload-or-apple-processing", "submission_id": self.state["submission_id"]}
-            self.state["apple_build"] = apple
-            self.save()
-            if apple["processingState"] != "VALID":
-                if apple["processingState"] in ("FAILED", "INVALID"):
-                    raise Blocked("Apple rejected the candidate binary; inspect processing errors")
-                return {"status": "pending", "phase": "apple-processing", "apple_build": apple}
-            if through == "upload":
-                return {"status": "complete", "through": "upload", "apple_build": apple}
-            if self.manifest["acceptance_policy"]["device"] == "required":
-                evidence(self.root, acceptance, "device", self.manifest, build)
-            version = self.version()
-            if version and self.version_state(version) in SUBMITTED:
-                evidence(self.root, acceptance, "store", self.manifest, build)
-                if acceptance["store"].get("metadata_digest") != fingerprint:
-                    raise Blocked("Store acceptance is stale for these release inputs")
-                if not self.stage_matches(version, apple, notes, localizations):
-                    raise Blocked("Submitted version does not match this build/metadata; inspect rather than edit it")
-                self.state.update(version_id=version["id"], metadata_digest=fingerprint)
-                self.done("review")
-                return {"status": "complete", "through": "review", "version_id": version["id"], "apple_state": self.version_state(version)}
-            pending = self.state.get("pending", {}).get("operation")
-            if pending == "review":
-                raise Uncertain("Review result unknown; draft state is not proof of submission")
-            if version and self.version_state(version) in {"REJECTED", "METADATA_REJECTED"}:
-                evidence(self.root, acceptance, "review_feedback", self.manifest, build)
-                feedback = acceptance["review_feedback"]
-                if feedback.get("version_id") != version["id"] or not text_ready(feedback.get("resolution_summary", "")):
-                    raise Blocked("Review feedback needs the current Apple Version ID and a concrete resolution")
-                if acceptance["review_feedback"].get("metadata_digest") != fingerprint:
-                    raise Blocked("Review feedback evidence is stale for the current release inputs")
-            elif version and self.version_state(version) not in {"PREPARE_FOR_SUBMISSION", "READY_FOR_REVIEW", "DEVELOPER_REJECTED"}:
-                raise Blocked("Inspect the current App Review outcome before changing or resubmitting this version")
-            version = self.apply_stage(apple, notes, localizations)
-            self.state.update(version_id=version["id"], metadata_digest=fingerprint)
-            self.done("stage")
-            self.validate_store(version["id"])
-            if through == "stage":
-                return {"status": "complete", "through": "stage", "version_id": version["id"]}
+                if len(matches) != 1:
+                    raise Uncertain("Upload returned no unique matching submission; inspect EAS/Apple")
+                self.state["submission_id"] = matches[0]["id"]
+                self.done("upload")
+            submission = self.call("eas", "submit:view", self.state["submission_id"], "--json")
+            if (submission.get("submittedBuild") or {}).get("id") != build["id"] or (submission.get("iosConfig") or {}).get("ascAppIdentifier") != self.manifest["app_id"]:
+                raise Blocked("EAS submission identity mismatch")
+            if submission.get("status") in ("ERRORED", "CANCELED"):
+                raise Blocked("EAS upload failed; inspect cause and reuse this build after correction")
+            return {"status": "pending", "phase": "upload-or-apple-processing", "submission_id": self.state["submission_id"]}
+        self.state["apple_build"] = apple
+        self.save()
+        if apple["processingState"] != "VALID":
+            if apple["processingState"] in ("FAILED", "INVALID"):
+                raise Blocked("Apple rejected the candidate binary; inspect processing errors")
+            return {"status": "pending", "phase": "apple-processing", "apple_build": apple}
+        if through == "upload":
+            return {"status": "complete", "through": "upload", "apple_build": apple}
+        if self.manifest["acceptance_policy"]["device"] == "required":
+            evidence(self.root, acceptance, "device", self.manifest, build)
+        version = self.version()
+        if version and self.version_state(version) in SUBMITTED:
             evidence(self.root, acceptance, "store", self.manifest, build)
             if acceptance["store"].get("metadata_digest") != fingerprint:
                 raise Blocked("Store acceptance is stale for these release inputs")
-            self.mutate("review", ["asc", "review", "submit", "--app", self.manifest["app_id"], "--version-id", version["id"],
-                "--build-id", apple["id"], "--confirm", "--output", "json"])
-            version = self.version()
-            if not version or linked(version, "build") != apple["id"] or self.version_state(version) not in SUBMITTED:
-                raise Uncertain("Review command returned but Apple has not verified formal submission")
+            if not self.stage_matches(version, apple, notes, localizations):
+                raise Blocked("Submitted version does not match this build/metadata; inspect rather than edit it")
+            self.state.update(version_id=version["id"], metadata_digest=fingerprint)
             self.done("review")
             return {"status": "complete", "through": "review", "version_id": version["id"], "apple_state": self.version_state(version)}
+        pending = self.state.get("pending", {}).get("operation")
+        if pending == "review":
+            raise Uncertain("Review result unknown; draft state is not proof of submission")
+        if version and self.version_state(version) in {"REJECTED", "METADATA_REJECTED"}:
+            evidence(self.root, acceptance, "review_feedback", self.manifest, build)
+            feedback = acceptance["review_feedback"]
+            if feedback.get("version_id") != version["id"] or not text_ready(feedback.get("resolution_summary", "")):
+                raise Blocked("Review feedback needs the current Apple Version ID and a concrete resolution")
+            if acceptance["review_feedback"].get("metadata_digest") != fingerprint:
+                raise Blocked("Review feedback evidence is stale for the current release inputs")
+        elif version and self.version_state(version) not in {"PREPARE_FOR_SUBMISSION", "READY_FOR_REVIEW", "DEVELOPER_REJECTED"}:
+            raise Blocked("Inspect the current App Review outcome before changing or resubmitting this version")
+        version = self.apply_stage(apple, notes, localizations)
+        self.state.update(version_id=version["id"], metadata_digest=fingerprint)
+        self.done("stage")
+        self.validate_store(version["id"])
+        if through == "stage":
+            return {"status": "complete", "through": "stage", "version_id": version["id"]}
+        evidence(self.root, acceptance, "store", self.manifest, build)
+        if acceptance["store"].get("metadata_digest") != fingerprint:
+            raise Blocked("Store acceptance is stale for these release inputs")
+        self.mutate("review", ["asc", "review", "submit", "--app", self.manifest["app_id"], "--version-id", version["id"],
+            "--build-id", apple["id"], "--confirm", "--output", "json"])
+        version = self.version()
+        if not version or linked(version, "build") != apple["id"] or self.version_state(version) not in SUBMITTED:
+            raise Uncertain("Review command returned but Apple has not verified formal submission")
+        self.done("review")
+        return {"status": "complete", "through": "review", "version_id": version["id"], "apple_state": self.version_state(version)}
 
 
 def prepare(root, version, base_ref, locales):
@@ -794,14 +872,17 @@ def prepare(root, version, base_ref, locales):
     return {"status": "prepared", "manifest": str(manifest_path), "remote_calls": 0}
 
 
-def plan(path, through="review"):
+def plan(path, through="review", github_only=False):
     root, directory, manifest = load_manifest(path)
     issues = []
     fingerprint = None
-    for check in (lambda: local_preflight(root, manifest), lambda: inputs(directory, manifest)):
+    checks = [lambda: inputs(directory, manifest)]
+    if not github_only:
+        checks.insert(0, lambda: local_preflight(root, manifest))
+    for check in checks:
         try:
             check()
-        except (Blocked, FileNotFoundError, KeyError) as error:
+        except (Blocked, github_release.GitHubError, CommandFailure, FileNotFoundError, KeyError) as error:
             issues.append(str(error))
     try:
         fingerprint = inputs(directory, manifest)[2]
@@ -812,12 +893,26 @@ def plan(path, through="review"):
             {"phase": "build", "tool": "eas build", "profile": manifest["profile"], "creates": "EAS Build ID"},
             {"phase": "upload", "tool": "eas submit --id", "requires": "Exact verified EAS Build"},
             {"phase": "stage", "tool": "asc versions create / metadata apply / attach-build / review details-update / versions update", "release_type": manifest["release_type"]},
-            {"phase": "review", "tool": "asc validate / review submit", "requires": "Same accepted Apple Build and formal state readback"}]}
+            {"phase": "review", "tool": "asc validate / review submit", "requires": "Same accepted Apple Build and formal state readback"},
+            {"phase": "github", "tool": "git tag / git push / gh release create", "requires": "Submitted exact Apple version/build and source-bound canonical notes"}]}
     result["phases"] = result["phases"][:STEPS.index(through) + 1]
+    if github_only:
+        result["phases"] = result["phases"][-1:]
+        result["mode"] = "github-only"
+    if through == "github":
+        try:
+            repo = github_release.repository(root, git)
+            commit, title = Pipeline(path).publisher().source_info(repo)
+            body = changelog.check_local(directory, manifest["version"], manifest["locales"])
+            result["github"] = {"repository": repo, "tag": "v" + manifest["version"], "source_commit": commit,
+                "title": title, "body_sha256": body["bodySha256"], "draft": False, "prerelease": False,
+                "latest": "resolve from full remote version history during execution"}
+        except (github_release.GitHubError, changelog.NotesError, CommandFailure, OSError, ValueError, KeyError) as error:
+            issues.append(str(error))
     return result
 
 
-def doctor(root, runner=None):
+def doctor(root, runner=None, through=None):
     runner = runner or Runner()
     config = project_config(root)
     issues = []
@@ -843,6 +938,11 @@ def doctor(root, runner=None):
                 issues.append("Authenticated ASC app identity differs")
         except (CommandFailure, OSError, ValueError):
             issues.append("ASC credentials cannot read the configured app")
+    if through == "github":
+        try:
+            github_release.Client(root, runner).preflight()
+        except (github_release.GitHubError, CommandFailure, OSError, ValueError):
+            issues.append("GitHub CLI, repository identity or write access is unverified")
     return {"status": "ready" if not issues else "blocked", "required_tools": config["tool_versions"],
             "asc_credentials_available": auth, "issues": issues, "remote_mutations": 0}
 
@@ -860,6 +960,96 @@ def status(root, runner=None):
         "live": {k: live.get(k) for k in ("versionString", "buildNumber", "state", "easBuildId", "easSubmissionId")},
         "testflight": [{k: b.get(k) for k in ("appVersion", "buildNumber", "processingState", "internalState", "externalState")}
                        for b in ios.get("testFlightBuilds", [])], "remote_mutations": 0}
+
+
+def release_status(path, runner=None):
+    pipeline = Pipeline(path, runner)
+    with locked(pipeline.path):
+        pipeline.state = read_json(pipeline.path) if pipeline.path.exists() else {"schema": 1}
+        state = pipeline.state
+        requested = state.get("requested_through", "review")
+        pending = []
+        for name in ("state", "github", "notes"):
+            receipt = pipeline.path.with_name(name + ".json")
+            data = read_json(receipt) if receipt.exists() else {}
+            if data.get("pending"):
+                pending.append({"channel": name, "operation": data["pending"]["operation"]})
+            if name == "notes":
+                pending.extend({"channel": name, "operation": op} for op, value in data.get("operations", {}).items()
+                               if value.get("status") == "pending")
+        apple, published, completed = {"status": "not-started"}, {"status": "not-verified"}, None
+        try:
+            if state.get("build_id"):
+                build = pipeline.call("eas", "build:view", state["build_id"], "--json")
+                verify_build(build, pipeline.manifest)
+                apple = {"status": "pending", "phase": "build", "build": safe_build(build)}
+                if build["status"] in ("ERRORED", "CANCELED"):
+                    apple["status"] = "blocked"
+                elif build["status"] == "FINISHED":
+                    completed = "build"
+                    apple["phase"] = "upload"
+                    bound = pipeline.apple_build(build)
+                    if bound:
+                        apple["apple_build"] = bound
+                    if bound and bound["processingState"] == "VALID":
+                        completed = "upload"
+                        apple["phase"] = "stage"
+                        version = pipeline.version()
+                        if version:
+                            apple.update(version_id=version["id"], apple_state=pipeline.version_state(version))
+                            if linked(version, "build") == bound["id"]:
+                                notes, localizations, _ = inputs(pipeline.directory, pipeline.manifest)
+                                if not pipeline.stage_matches(version, bound, notes, localizations):
+                                    raise Blocked("Staged version differs from the requested metadata")
+                                pipeline.validate_store(version["id"])
+                                completed, apple["phase"] = "stage", "review"
+                                if pipeline.version_state(version) in SUBMITTED:
+                                    pipeline.github_evidence()
+                                    completed = "review"
+                                    apple["status"] = "verified"
+        except (Blocked, github_release.GitHubError, CommandFailure, OSError, ValueError, KeyError):
+            apple.update(status="blocked", reason="Exact Apple candidate, acceptance or remote state is unverified")
+        try:
+            publisher = pipeline.publisher()
+            identity = publisher.preflight(write=requested == "github")
+            tag = "v" + pipeline.manifest["version"]
+            remote = publisher.remote_tag(tag)
+            item = publisher.release(identity["repository"], tag)
+            published = {"status": "missing", "tag": tag, "tag_source": remote}
+            if remote not in (None, pipeline.manifest["source_commit"]):
+                raise github_release.GitHubError("Tag source conflict")
+            if item:
+                intent = publisher.intent(identity)
+                publisher.verify_release(item, intent)
+                if remote != intent["source_commit"]:
+                    raise github_release.GitHubError("Published tag source is unverified")
+                previous = publisher.journal.get("intent", {})
+                if previous and any(previous.get(k) != v for k, v in intent.items()):
+                    raise github_release.GitHubError("GitHub publication journal identity differs")
+                latest = publisher.latest_policy(identity["repository"], tag)
+                newest = publisher.api(f"repos/{identity['repository']}/releases/latest", optional=True)
+                if not newest or (newest.get("id") == item["id"]) != latest:
+                    raise github_release.GitHubError("GitHub Latest differs from version history")
+                published.update(status="verified", release_id=item["id"], url=item["html_url"], latest=latest)
+        except (Blocked, github_release.GitHubError, CommandFailure, OSError, ValueError, KeyError):
+            published.update(status="blocked", reason="Exact GitHub repository, tag or Release is unverified")
+        if pending:
+            overall = "uncertain"
+        elif apple["status"] == "blocked" or requested == "github" and published["status"] == "blocked":
+            overall = "blocked"
+        elif requested == "github" and completed == "review" and published["status"] == "verified":
+            overall, completed = "complete", "github"
+        elif requested != "github" and completed and STEPS.index(completed) >= STEPS.index(requested):
+            overall = "complete"
+        else:
+            overall = "pending" if state.get("build_id") else "not-started"
+        return {"status": "read-only", "version": pipeline.manifest["version"], "requested_through": requested,
+            "completed_through": completed, "overall_status": overall, "apple": apple, "github": published,
+            "pending_operations": pending, "remote_mutations": 0,
+            "next_action": ("Resume the same endpoint to reconcile pending writes; inspect unresolved absence" if pending else
+                            "Inspect the reported channel and resolve its blocker" if overall == "blocked" else
+                            "None for the requested endpoint" if overall == "complete" else
+                            "Resume the requested endpoint when its prerequisites are ready")}
 
 
 def checks(path, runner=None):
@@ -887,6 +1077,23 @@ def checks(path, runner=None):
     return {"status": "passed" if acceptance["code"]["passed"] else "blocked", "checks": outcomes}
 
 
+def failure_context(args):
+    if not getattr(args, "manifest", None):
+        return {}
+    try:
+        pipeline = Pipeline(args.manifest)
+        state = pipeline.state
+        journal = read_json(pipeline.path.with_name("github.json")) if pipeline.path.with_name("github.json").exists() else {}
+        target = "github" if args.command == "github" else getattr(args, "through", state.get("requested_through", "review"))
+        pending = journal.get("pending") or state.get("pending")
+        phase = "github" if args.command == "github" or journal.get("pending") or target == "github" and state.get("receipts", {}).get("review") else (
+            pending.get("operation", "preflight") if pending else "preflight")
+        return {"requested_through": target, "phase": phase,
+                "completed_through": "review" if state.get("receipts", {}).get("review") else None}
+    except (Blocked, CommandFailure, OSError, ValueError, KeyError):
+        return {}
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
@@ -901,15 +1108,20 @@ def main(argv=None):
     for name in ("doctor", "status", "prepare"):
         command = commands.add_parser(name)
         command.add_argument("--root", type=Path, default=Path.cwd())
+        if name == "status":
+            command.add_argument("--manifest", type=Path)
+        if name == "doctor":
+            command.add_argument("--through", choices=STEPS)
         if name == "prepare":
             command.add_argument("--version", required=True)
             command.add_argument("--base-ref", required=True)
             command.add_argument("--locales", nargs="+", required=True)
-    for name in ("plan", "checks", "run", "adopt", "candidate", "retry-upload"):
+    for name in ("plan", "checks", "run", "github", "adopt", "candidate", "retry-upload"):
         command = commands.add_parser(name)
         command.add_argument("--manifest", type=Path, required=True)
-        if name == "run":
+        if name in ("run", "github"):
             command.add_argument("--execute", action="store_true")
+        if name in ("run", "plan"):
             command.add_argument("--through", choices=STEPS, default="review")
         if name == "adopt":
             command.add_argument("--build-id", required=True)
@@ -936,7 +1148,8 @@ def main(argv=None):
                 with locked(state_path(root, args.version)):
                     result = changelog.remote_notes(root, directory, manifest, args.channels,
                         getattr(args, "execute", False), Runner(),
-                        {"state_path": state_path, "now": now, "atomic_json": atomic_json, "app_id": manifest["app_id"], "git": git})
+                        {"state_path": state_path, "now": now, "atomic_json": atomic_json, "app_id": manifest["app_id"],
+                         "git": git, "github": github_release})
             elif args.command == "notes-sync":
                 raise Blocked("Select notes channels explicitly")
             else:
@@ -944,12 +1157,16 @@ def main(argv=None):
                 result = {"status": "verified", "version": args.version, "body_sha256": data["bodySha256"], "remote_calls": 0}
         elif args.command == "prepare":
             result = prepare(args.root.resolve(), args.version, args.base_ref, args.locales)
-        elif args.command in ("doctor", "status"):
-            result = globals()[args.command](args.root.resolve())
+        elif args.command == "doctor":
+            result = doctor(args.root.resolve(), through=args.through)
+        elif args.command == "status":
+            result = release_status(args.manifest) if args.manifest else status(args.root.resolve())
         elif args.command == "checks":
             result = checks(args.manifest)
         elif args.command == "plan" or args.command == "run" and not args.execute:
             result = plan(args.manifest, getattr(args, "through", "review"))
+        elif args.command == "github":
+            result = Pipeline(args.manifest).github() if args.execute else plan(args.manifest, "github", github_only=True)
         elif args.command == "adopt":
             result = Pipeline(args.manifest).adopt(args.build_id)
         elif args.command == "candidate":
@@ -958,14 +1175,14 @@ def main(argv=None):
             result = Pipeline(args.manifest).retry_upload()
         else:
             result = Pipeline(args.manifest).run(args.through)
-    except (Uncertain, changelog.NotesUncertain) as error:
-        print(json.dumps({"status": "uncertain", "reason": str(error)}, ensure_ascii=False))
+    except (Uncertain, changelog.NotesUncertain, github_release.GitHubUncertain) as error:
+        print(json.dumps({"status": "uncertain", "reason": str(error), **failure_context(args)}, ensure_ascii=False))
         return 3
-    except (Blocked, changelog.NotesError) as error:
-        print(json.dumps({"status": "blocked", "reason": str(error)}, ensure_ascii=False))
+    except (Blocked, changelog.NotesError, github_release.GitHubError) as error:
+        print(json.dumps({"status": "blocked", "reason": str(error), **failure_context(args)}, ensure_ascii=False))
         return 2
     except (CommandFailure, subprocess.TimeoutExpired, OSError, ValueError, KeyError):
-        print(json.dumps({"status": "blocked", "reason": "Required command or input failed; inspect the phase using supported tools"}))
+        print(json.dumps({"status": "blocked", "reason": "Required command or input failed; inspect the phase using supported tools", **failure_context(args)}))
         return 2
     print(json.dumps(result, ensure_ascii=False, indent=2))
     return 2 if result["status"] in ("blocked", "differences") else 0
