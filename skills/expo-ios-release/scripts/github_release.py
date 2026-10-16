@@ -164,7 +164,7 @@ class Publisher(Client):
 
     def intent(self, identity):
         source, title = self.source_info(identity["repository"])
-        data = self.h["notes"].check_local(self.p.directory, self.p.manifest["version"], self.p.manifest["locales"])
+        data = self.h["notes"].check_local(self.p.directory, self.p.manifest["version"], self.p.manifest["locales"], self.p.config, self.root)
         state = self.p.state
         return {**identity, "source_commit": source, "tag": "v" + self.p.manifest["version"], "title": title,
             "body_sha256": data["bodySha256"], "notes_path": str((self.p.directory / "release-notes.md").relative_to(self.root)),

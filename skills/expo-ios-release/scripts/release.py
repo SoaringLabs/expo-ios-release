@@ -140,6 +140,10 @@ def project_config(root):
             raise Blocked(f"{field} must be a repository-relative directory")
         if not (root / value).resolve().is_relative_to(root):
             raise Blocked(f"{field} resolves outside the repository")
+    adapter = data.get("notes_adapter")
+    if adapter is not None and (not isinstance(adapter, list) or not adapter or
+                                any(not isinstance(arg, str) or not arg for arg in adapter)):
+        raise Blocked("notes_adapter must be a nonempty command argument array")
     commands = data.get("checks")
     if not isinstance(commands, list) or not commands or any(
             not isinstance(cmd, list) or not cmd or any(not isinstance(arg, str) or not arg for arg in cmd)
@@ -233,9 +237,9 @@ def text_ready(text):
         r"\b(?:TODO|TBD|FIXME)\b|Lorem ipsum|待填写|<[^>]+>", text, re.I)
 
 
-def inputs(directory, manifest):
+def inputs(directory, manifest, config=None, root=None):
     try:
-        changelog.check_local(directory, manifest["version"], manifest["locales"])
+        changelog.check_local(directory, manifest["version"], manifest["locales"], config, root)
     except changelog.NotesError as error:
         raise Blocked(str(error)) from error
     notes = (directory / "review-notes.txt").read_text().strip()
@@ -394,6 +398,7 @@ def locked(path):
 class Pipeline:
     def __init__(self, path, runner=None):
         self.root, self.directory, self.manifest = load_manifest(path)
+        self.config = project_config(self.root)
         self.runner = runner or Runner()
         self.path = state_path(self.root, self.manifest["version"])
         self.state = read_json(self.path) if self.path.exists() else {"schema": 1}
@@ -441,7 +446,7 @@ class Pipeline:
         for group in ("production", "device"):
             if self.manifest["acceptance_policy"][group] == "required":
                 evidence(self.root, acceptance, group, self.manifest, build if group == "device" else None)
-        notes, localizations, fingerprint = inputs(self.directory, self.manifest)
+        notes, localizations, fingerprint = inputs(self.directory, self.manifest, self.config, self.root)
         if acceptance["store"].get("metadata_digest") != fingerprint or not self.stage_matches(version, apple, notes, localizations):
             raise Blocked("Store acceptance or submitted metadata differs from the publication inputs")
         return self.version_state(version)
@@ -661,6 +666,11 @@ class Pipeline:
 
     def candidate(self):
         with locked(self.path):
+            if self.config.get("notes_adapter"):
+                try:
+                    changelog.check_local(self.directory, self.manifest["version"], self.manifest["locales"], self.config, self.root)
+                except changelog.NotesError as error:
+                    raise Blocked(str(error)) from error
             self.state = read_json(self.path) if self.path.exists() else {"schema": 1}
             github_release.guard_writes(self.path.parent, allow="state")
             if self.path.with_name("github.json").exists():
@@ -721,7 +731,7 @@ class Pipeline:
         if self.state.get("source") not in (None, candidate):
             raise Blocked("Checkpoint source/config changed; start a new candidate")
         self.state["source"] = candidate
-        notes, localizations, fingerprint = inputs(self.directory, self.manifest) if through in ("stage", "review") else (None, None, None)
+        notes, localizations, fingerprint = inputs(self.directory, self.manifest, self.config, self.root) if through in ("stage", "review") else (None, None, None)
         toolcheck(self.root, self.runner, require_asc=through != "build")
         if through != "build" and not asc_auth(self.root, self.runner):
             raise Blocked("Independent ASC authentication is missing; EAS managed access is separate")
@@ -874,9 +884,10 @@ def prepare(root, version, base_ref, locales):
 
 def plan(path, through="review", github_only=False):
     root, directory, manifest = load_manifest(path)
+    config = project_config(root)
     issues = []
     fingerprint = None
-    checks = [lambda: inputs(directory, manifest)]
+    checks = [lambda: inputs(directory, manifest, config, root)]
     if not github_only:
         checks.insert(0, lambda: local_preflight(root, manifest))
     for check in checks:
@@ -885,7 +896,7 @@ def plan(path, through="review", github_only=False):
         except (Blocked, github_release.GitHubError, CommandFailure, FileNotFoundError, KeyError) as error:
             issues.append(str(error))
     try:
-        fingerprint = inputs(directory, manifest)[2]
+        fingerprint = inputs(directory, manifest, config, root)[2]
     except (Blocked, FileNotFoundError, KeyError):
         pass
     result = {"status": "plan", "version": manifest["version"], "app_id": manifest["app_id"], "remote_calls": 0,
@@ -903,7 +914,7 @@ def plan(path, through="review", github_only=False):
         try:
             repo = github_release.repository(root, git)
             commit, title = Pipeline(path).publisher().source_info(repo)
-            body = changelog.check_local(directory, manifest["version"], manifest["locales"])
+            body = changelog.check_local(directory, manifest["version"], manifest["locales"], config, root)
             result["github"] = {"repository": repo, "tag": "v" + manifest["version"], "source_commit": commit,
                 "title": title, "body_sha256": body["bodySha256"], "draft": False, "prerelease": False,
                 "latest": "resolve from full remote version history during execution"}
@@ -998,7 +1009,7 @@ def release_status(path, runner=None):
                         if version:
                             apple.update(version_id=version["id"], apple_state=pipeline.version_state(version))
                             if linked(version, "build") == bound["id"]:
-                                notes, localizations, _ = inputs(pipeline.directory, pipeline.manifest)
+                                notes, localizations, _ = inputs(pipeline.directory, pipeline.manifest, pipeline.config, pipeline.root)
                                 if not pipeline.stage_matches(version, bound, notes, localizations):
                                     raise Blocked("Staged version differs from the requested metadata")
                                 pipeline.validate_store(version["id"])
@@ -1141,7 +1152,7 @@ def main(argv=None):
             else:
                 raise Blocked("Prepare the release manifest with explicit locales first")
             if args.command == "notes-generate":
-                result = changelog.generate(directory, args.version, manifest["locales"], atomic_json)
+                result = changelog.generate(directory, args.version, manifest["locales"], atomic_json, config, root)
             elif args.channels:
                 if not manifest_path.is_file():
                     raise Blocked("Remote notes operations need the existing release manifest")
@@ -1149,11 +1160,11 @@ def main(argv=None):
                     result = changelog.remote_notes(root, directory, manifest, args.channels,
                         getattr(args, "execute", False), Runner(),
                         {"state_path": state_path, "now": now, "atomic_json": atomic_json, "app_id": manifest["app_id"],
-                         "git": git, "github": github_release})
+                         "git": git, "github": github_release, "config": config})
             elif args.command == "notes-sync":
                 raise Blocked("Select notes channels explicitly")
             else:
-                data = changelog.check_local(directory, args.version, manifest["locales"])
+                data = changelog.check_local(directory, args.version, manifest["locales"], config, root)
                 result = {"status": "verified", "version": args.version, "body_sha256": data["bodySha256"], "remote_calls": 0}
         elif args.command == "prepare":
             result = prepare(args.root.resolve(), args.version, args.base_ref, args.locales)

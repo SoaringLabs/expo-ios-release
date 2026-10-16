@@ -4,6 +4,7 @@ import io
 import json
 from pathlib import Path
 import tempfile
+import sys
 import unittest
 from unittest.mock import patch
 import test_release
@@ -276,6 +277,67 @@ class ChangelogTest(unittest.TestCase):
         self.assertEqual(self.sync(channels=["asc", "testflight", "github"])["status"], "verified")
         self.assertEqual(len(self.remote.writes), 6)
 
+
+
+class MarkdownAdapterTest(unittest.TestCase):
+    def setUp(self):
+        self.fixture = ChangelogTest()
+        self.fixture.setUp()
+        self.addCleanup(self.fixture.doCleanups)
+        self.root, self.directory = self.fixture.root, self.fixture.directory
+        self.markdown = "## Improvements\n\n1. Search opens faster.\n\n> Thanks."
+        self.plain = "Improvements\n1. Search opens faster.\n\nThanks."
+        self.adapter = self.root / "adapter.py"
+        self.adapter.write_text("import json,sys\nfrom pathlib import Path\nbody=Path(sys.argv[1]).read_text().replace('\\r\\n','\\n').rstrip('\\n')\nprint(json.dumps({'schema':1,'markdown':body,'plainText':body.replace('## Improvements\\n\\n','Improvements\\n').replace('> ', '')}))\n")
+        self.config = {"notes_adapter": [sys.executable, str(self.adapter)]}
+        self.fixture.helpers["config"] = self.config
+        (self.directory / "release-notes.md").write_text(self.markdown + "\n")
+        (self.directory / "what-to-test.template.txt").write_text("{{CHANGELOG}}\n\nTest offline search.")
+        self.generate()
+
+    def generate(self):
+        return notes.generate(self.directory, "9.9.9", ["zh-Hans"], release.atomic_json, self.config, self.root)
+
+    def test_one_source_projects_plain_apple_fields_and_markdown_github(self):
+        data = notes.check_local(self.directory, "9.9.9", ["zh-Hans"], self.config, self.root)
+        self.assertEqual(data["releaseNotes"], self.markdown)
+        self.assertEqual(data["bodySha256"], notes.body_digest(self.markdown))
+        self.assertEqual(data["plainText"], self.plain)
+        self.assertEqual(data["plainTextSha256"], notes.body_digest(self.plain))
+        self.fixture.sync(channels=["asc", "github", "testflight"])
+        self.assertEqual(self.fixture.remote.locale["attributes"]["whatsNew"], self.plain)
+        self.assertEqual(self.fixture.remote.github["body"].rstrip("\n"), self.markdown)
+        self.assertIn(self.plain, self.fixture.remote.review["attributes"]["notes"])
+        self.assertIn(self.plain, self.fixture.remote.beta["attributes"]["whatsNew"])
+        self.assertIn("Privacy and access", self.fixture.remote.review["attributes"]["notes"])
+
+    def test_rejected_or_rewritten_source_never_overwrites_existing_projections(self):
+        before = {p: p.read_bytes() for p in self.directory.rglob("*") if p.is_file()}
+        for script in ["import sys;sys.exit(2)", "import json;print(json.dumps({'schema':1,'markdown':'rewritten','plainText':'other'}))", "print('not json')"]:
+            self.adapter.write_text(script)
+            with self.subTest(script=script), self.assertRaises(notes.NotesError):
+                self.generate()
+            self.assertEqual(before, {p: p.read_bytes() for p in before})
+            self.assertEqual(self.fixture.remote.writes, [])
+
+    def test_markdown_cannot_be_written_into_plain_channel_independently(self):
+        release.atomic_json(self.directory / "metadata/version/9.9.9/zh-Hans.json", {"whatsNew": self.markdown})
+        with self.assertRaisesRegex(notes.NotesError, "copies differ"):
+            self.fixture.sync()
+        self.assertEqual(self.fixture.remote.writes, [])
+
+    def test_each_locale_uses_its_own_source_and_projection(self):
+        source = self.directory / "release-notes.en-US.md"
+        source.write_text("## Improvements\n\n1. English content.")
+        notes.generate(self.directory, "9.9.9", ["zh-Hans", "en-US"], release.atomic_json, self.config, self.root)
+        data = notes.check_local(self.directory, "9.9.9", ["zh-Hans", "en-US"], self.config, self.root)
+        self.assertEqual(data["localizations"]["en-US"]["plainText"], "Improvements\n1. English content.")
+        self.assertEqual(data["localizations"]["zh-Hans"]["releaseNotes"], self.markdown)
+        source.unlink()
+        before = (self.directory / "release-notes.json").read_bytes()
+        with self.assertRaises(notes.NotesError):
+            notes.generate(self.directory, "9.9.9", ["zh-Hans", "en-US"], release.atomic_json, self.config, self.root)
+        self.assertEqual((self.directory / "release-notes.json").read_bytes(), before)
 
 if __name__ == "__main__":
     unittest.main()

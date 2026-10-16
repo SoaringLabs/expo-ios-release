@@ -26,6 +26,7 @@ These IDs are synthetic examples. Replace all identity values and checks with th
 | `build_profile`, `submit_profile` | Required existing profile names; may differ. Inheritance is resolved, including iOS overrides. |
 | `release_docs` | Repository-relative version directory; defaults to `release-docs/versions`. |
 | `artifact_dir` | Repository-relative local evidence directory; defaults to `.artifacts`. |
+| `notes_adapter` | Optional read-only command argument array. Appended arguments are the absolute source path and locale; stdout must contain schema 1 `markdown` and `plainText`. Runs before generation, local/remote notes checks, staging/publication checks and candidate freezing. See [projection contract](changelog.md). |
 | `checks` | Required nonempty arrays of command arguments, run without a shell. Use concrete test paths when your runner requires them. |
 | `acceptance_policy` | Each of `production` and `device` defaults to `required`. Use `user-managed` only for an established human-owned responsibility; the helper skips that gate without claiming it passed. Frozen into the manifest. |
 | `tool_versions` | Exact EAS/ASC versions. Defaults above match the tested CLI contracts. Overrides require compatibility validation against installed help and regression coverage. |
@@ -54,11 +55,13 @@ Adapt those paths if configured differently. Commit the project configuration, r
 
 ## Locale inputs
 
-The first locale given to `prepare --locales` owns `release-notes.md`, the GitHub Release body and the review notes' `{{CHANGELOG}}`. Every other locale needs `release-notes.LOCALE.md`. Generation validates all translations/templates before writing projections. It copies each locale only into that locale's What's New. Reviewer instructions are one shared Apple review-notes field.
+The first locale given to `prepare --locales` owns `release-notes.md`, the GitHub Release body and the review notes' `{{CHANGELOG}}`. Every other locale needs `release-notes.LOCALE.md`. Generation validates all translations/templates before writing projections. With a configured adapter, each locale's Markdown is preserved and its plain-text projection fills that locale's What's New; without an adapter the body is copied unchanged. Reviewer instructions are one shared Apple review-notes field.
 
 Optional TestFlight templates use `what-to-test.template.txt` for the first locale and `what-to-test.LOCALE.template.txt` for the others, each with one slot. TestFlight synchronization requires a template for every configured locale and matching existing remote localizations; locale creation is an explicit remediation step, not an implicit translation fallback.
 
-Generated files are `metadata/version/VERSION/LOCALE.json`, `review-notes.txt`, optional `what-to-test[.LOCALE].txt`, and `release-notes.json` containing each body and its normalized hash. CRLF/LF and final-newline differences normalize for comparisons. There is no product backend integration; consuming/deploying this data belongs to the app project.
+The adapter and project rules own content format; the generic tool does not hard-code product categories or summarize source diffs.
+
+Generated files are `metadata/version/VERSION/LOCALE.json`, `review-notes.txt`, optional `what-to-test[.LOCALE].txt`, and `release-notes.json` containing each canonical body and its normalized hash, plus `format: markdown`, `plainText` and `plainTextSha256` when an adapter is configured. CRLF/LF and final-newline differences normalize for comparisons. There is no product backend integration; consuming/deploying this data belongs to the app project.
 
 ## Existing releases
 

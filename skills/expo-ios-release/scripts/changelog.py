@@ -37,22 +37,56 @@ def localized_body(directory, locales, locale):
     return parse(path.read_text(encoding="utf-8"))["body"]
 
 
-def projections(directory, version, locales):
+def project_body(directory, locales, locale, config=None, root=None):
+    source = localized_body(directory, locales, locale)
+    adapter = (config or {}).get("notes_adapter")
+    if not adapter:
+        return source, source
+    if root is None:
+        raise NotesError("Project notes adapter needs the application root")
+    source_path = directory / ("release-notes.md" if locale == locales[0] else f"release-notes.{locale}.md")
+    try:
+        result = subprocess.run([*adapter, str(source_path.resolve()), locale], cwd=root,
+                                capture_output=True, text=True, timeout=30)
+    except (OSError, subprocess.TimeoutExpired) as error:
+        raise NotesError(f"Project notes adapter could not run: {error}") from error
+    if result.returncode:
+        raise NotesError("Project notes adapter rejected the source: " + result.stderr.strip())
+    try:
+        value = json.loads(result.stdout)
+        if not isinstance(value, dict) or value.get("schema") != 1 or not isinstance(value.get("markdown"), str) or not isinstance(value.get("plainText"), str):
+            raise ValueError("Expected schema 1, markdown and plainText")
+        if normalize(value["markdown"]) != source:
+            raise ValueError("Adapter must preserve the canonical Markdown")
+        plain = parse(value["plainText"])["body"]
+    except (ValueError, TypeError) as error:
+        raise NotesError(f"Invalid project notes projection: {error}") from error
+    return source, plain
+
+
+def projections(directory, version, locales, config=None, root=None):
     if not locales or len(set(locales)) != len(locales) or any(
             not re.fullmatch(r"[A-Za-z]{2,3}(?:-[A-Za-z0-9]{2,8})*", loc) for loc in locales):
         raise NotesError("Select unique actual ASC locales")
-    bodies = {loc: localized_body(directory, locales, loc) for loc in locales}
+    projected = {loc: project_body(directory, locales, loc, config, root) for loc in locales}
+    bodies = {loc: value[0] for loc, value in projected.items()}
+    plain_bodies = {loc: value[1] for loc, value in projected.items()}
     body = bodies[locales[0]]
     data = {"schema": 1, "version": version, "locale": locales[0],
             "releaseNotes": body, "bodySha256": body_digest(body),
             "localizations": {loc: {"releaseNotes": value, "bodySha256": body_digest(value)}
                               for loc, value in bodies.items()}}
+    if (config or {}).get("notes_adapter"):
+        data.update(format="markdown", plainText=plain_bodies[locales[0]],
+                    plainTextSha256=body_digest(plain_bodies[locales[0]]))
+        for loc, plain in plain_bodies.items():
+            data["localizations"][loc].update(plainText=plain, plainTextSha256=body_digest(plain))
     files = {directory / "metadata" / "version" / version / f"{loc}.json":
              json.dumps({"whatsNew": value}, ensure_ascii=False, indent=2) + "\n"
-             for loc, value in bodies.items()}
+             for loc, value in plain_bodies.items()}
     files[directory / "release-notes.json"] = json.dumps(data, ensure_ascii=False, indent=2) + "\n"
-    templates = [("review-notes", "review-notes.template.txt", "review-notes.txt", body, True)]
-    for loc, value in bodies.items():
+    templates = [("review-notes", "review-notes.template.txt", "review-notes.txt", plain_bodies[locales[0]], True)]
+    for loc, value in plain_bodies.items():
         suffix = "" if loc == locales[0] else "." + loc
         templates.append(("what-to-test", f"what-to-test{suffix}.template.txt", f"what-to-test{suffix}.txt", value, False))
     for name, template_name, output_name, value, required in templates:
@@ -69,8 +103,8 @@ def projections(directory, version, locales):
     return data, files
 
 
-def check_local(directory, version, locales):
-    data, files = projections(directory, version, locales)
+def check_local(directory, version, locales, config=None, root=None):
+    data, files = projections(directory, version, locales, config, root)
     differences = [str(p.relative_to(directory)) for p, expected in files.items()
                    if not p.is_file() or normalize(p.read_text(encoding="utf-8")) != normalize(expected)]
     if differences:
@@ -78,8 +112,8 @@ def check_local(directory, version, locales):
     return data
 
 
-def generate(directory, version, locales, atomic_json):
-    data, files = projections(directory, version, locales)
+def generate(directory, version, locales, atomic_json, config=None, root=None):
+    data, files = projections(directory, version, locales, config, root)
     for path in files:
         if path.parent.parent.name == "version" and path.parent.parent.parent.name == "metadata" and path.suffix == ".json" and path.exists() and set(json.loads(path.read_text())) != {"whatsNew"}:
             raise NotesError("Keep unrelated metadata fields out of the generated What's New file")
@@ -95,7 +129,7 @@ def generate(directory, version, locales, atomic_json):
 
 def remote_notes(root, directory, manifest, channels, execute, runner, helpers):
     """Read first; mutations are limited to notes on existing resources."""
-    data = check_local(directory, manifest["version"], manifest["locales"])
+    data = check_local(directory, manifest["version"], manifest["locales"], helpers.get("config"), root)
     version = manifest["version"]
     state_file = helpers["state_path"](root, version)
     journal_path = state_file.parent / "notes.json"
@@ -150,7 +184,7 @@ def remote_notes(root, directory, manifest, channels, execute, runner, helpers):
                     attributes = next(r for r in asc_locales() if r["id"] == target)["attributes"]
                     return {k: v for k, v in attributes.items() if k != "whatsNew"}
                 invariants.append((locale_fields, old_fields))
-                expected = data["localizations"][locale]["releaseNotes"]
+                expected = data["localizations"][locale].get("plainText", data["localizations"][locale]["releaseNotes"])
                 operation = "asc:whatsNew" if len(manifest["locales"]) == 1 else "asc:whatsNew:" + locale
                 targets.append((operation, loc_id, expected,
                     lambda target=loc_id: next(r for r in asc_locales() if r["id"] == target)["attributes"]["whatsNew"],
