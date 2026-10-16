@@ -1,55 +1,39 @@
 # GitHub tag and Release
 
-Continue here after formal App Review submission in an authorized standard release, or for an authorized GitHub-only backfill. Planning-only tasks stop with a plan. A backfill reuses the existing binary/source and never restarts Apple release mutations.
-
-## Bind and prepare
-
-Read the manifest, acceptance and private checkpoint. Resolve VERSION, full SOURCE=`source_commit`, TAG=`vVERSION`, and the exact EAS/Apple IDs. Verify the EAS Build is FINISHED and matches source/app/project/profile/version/distribution. Freshly read Apple's exact Version and attached Build; require a submitted or later state supported by the helper. READY_FOR_REVIEW is insufficient.
-
-Resolve SOURCE locally with `git rev-parse --verify "$SOURCE^{commit}"`. Inspect its app/package version. For dynamic Expo config, reuse the build's verified effective configuration; HEAD may contain later documentation and is not the tag target.
-
-Verify the origin fetch and push destinations identify the same GitHub repository and confirm access with `gh repo view "$REPO" --json nameWithOwner`. Read installed release command help. Preserve existing authentication. Derive the title from the app's established convention, otherwise `APP_NAME vVERSION`. Standard output is non-draft and non-prerelease.
-
-Use the reviewed `release-notes.md` directly with `--notes-file`. Verify `notes-check` locally before publication. Keep technical evidence, Apple state/availability, credentials, local paths and signed artifact links in a separate sanitized release record. Source archives are automatic; IPA/dSYM publication needs separate scope.
-
-Maintain an independent `.git/expo-ios-release/VERSION/github.json` journal under the existing release lock. Bind SOURCE, exact build/version IDs, canonical notes path/hash, tag, title and repository. Before each mutation save pending intent; after it save verified result/time. Preserve Apple receipts and reuse saved publication intent on resume.
-
-## Publish conditionally
-
-Read the exact remote resources first:
+The helper implements this phase in `scripts/github_release.py`. A standard authorized release uses:
 
 ```bash
-git ls-remote --exit-code origin "refs/tags/$TAG" "refs/tags/$TAG^{}"
-gh api "repos/$REPO/releases/tags/$TAG"
+python3 "$HELPER" run --manifest "$PATH" --execute --through github
 ```
 
-For `ls-remote`, exit 2 means no matching tag; other failures are unresolved. Only a real HTTP 404 after repository access verification proves no Release. For annotated tags compare the remote peeled `^{}` SHA with SOURCE; for lightweight tags compare direct SHA. Inspect existing local tag's resolved commit too. Conflicting tags remain intact and block publication.
-
-When both local and remote tags are absent, create an annotated tag on SOURCE. Push only the exact matching local tag when remote is absent:
+For an authorized GitHub-only backfill or recovery:
 
 ```bash
-git tag -a "$TAG" "$SOURCE" -m "$TITLE"
-git push origin "refs/tags/$TAG:refs/tags/$TAG"
+python3 "$HELPER" github --manifest "$PATH"
+python3 "$HELPER" github --manifest "$PATH" --execute
+python3 "$HELPER" status --manifest "$PATH"
 ```
 
-These are individual conditional actions. Reread the remote tag's commit before creating a Release. Compare formal version history numerically to choose Latest: newer release `true`, older backfill `false`. Resolve truncated history or ambiguous version conventions before selecting Latest.
+The first command is an offline preview. GitHub-only execution reads the bound EAS/Apple resources and makes no build, upload, staging or review writes. A later working HEAD is supported: the tag always resolves to manifest `source_commit`. `run --through review` and the default endpoint remain Apple-only.
 
-For a verified absent Release:
+## Binding and verification
 
-```bash
-gh release create "$TAG" --repo "$REPO" --verify-tag \
-  --title "$TITLE" --notes-file "$NOTES" --latest="$LATEST"
-```
+Publication requires the finished exact EAS Build, valid Apple Build and formally submitted exact Apple Version. Code/artifact/store acceptance and any required production/device evidence must still match the source/build; current store acceptance must match the canonical metadata digest and staged remote fields. A draft Apple version is insufficient.
 
-[`--verify-tag`](https://cli.github.com/manual/gh_release_create) prevents the CLI from creating a missing tag from the default branch. Verify remote tag source again, then read:
+The source commit must exist locally and its package/static app version must match the manifest. A dynamic Expo config is not evaluated from the current HEAD during backfill. The title uses the source's static app name or repository name; an optional manifest `github.title` preserves an established convention.
 
-```bash
-gh release view "$TAG" --repo "$REPO" \
-  --json tagName,name,body,isDraft,isPrerelease,url,publishedAt,assets
-```
+Origin fetch and its single push destination must name the same GitHub.com repository. An authenticated API read binds the numeric repository ID and verifies write access. GitHub API calls explicitly select github.com. Permission/network failures are blockers, not evidence that a tag or Release is missing. Only `git ls-remote` exit 2 or a real HTTP 404 after repository verification establishes initial absence.
 
-Require intended tag/title/body, non-draft/non-prerelease state, published URL/date and exact tag commit=SOURCE. `targetCommitish` may be a branch and is not commit proof. Check `repos/$REPO/releases/latest` when Latest matters, and run `notes-check --channels github` for body/source readback. Record GitHub URL/source separately from Apple review and App Store availability.
+The helper reads local and remote tags before writing. New tags are annotated and point to the full source commit. Existing lightweight or annotated tags are reusable if their resolved commit matches. Conflicting refs are preserved and block publication. An existing Release without a verified matching tag also blocks.
 
-## Resume
+The Release uses the canonical `release-notes.md` via `--notes-file`, with `--verify-tag`, a frozen title, non-draft/non-prerelease flags and explicit Latest selection. Full paginated formal `vX.Y.Z` history is compared numerically: a newer version is Latest; an older backfill is not. Ambiguous formal tag conventions block selection. Exact body, tag source, ID, URL/date and Latest are read back after publication. `target_commitish` is not source proof. Source archives are automatic; IPA/dSYM attachments require separate scope.
 
-After an uncertain push/create, preserve pending intent and reread that tag/Release. Matching result completes the operation; continue only missing actions. Different body/title/flags are a conflict to inspect rather than silently overwrite. Absence after an uncertain write remains uncertain until a definite failed outcome is established. GitHub trouble never triggers another EAS build/upload or Apple review submission.
+## Journal and recovery
+
+The helper owns `.git/expo-ios-release/VERSION/github.json` under the same lock as Apple and notes operations. It records repository identity, source, exact EAS/Apple IDs, tag/title, canonical notes path/hash, publish flags, and verified remote identity. Each of `tag:create`, `tag:push` and `release:create` records pending intent before dispatch and verification after readback. Private journals contain no CLI dumps, credentials or signed artifact URLs.
+
+Resume with the same manifest and command. A matching result reconciles only the pending operation, then missing later steps continue. If a response was lost after the remote effect succeeded, no duplicate mutation is dispatched. Absence after an uncertain write does not prove failure and remains blocked for inspection; preserve the original intent until a definite outcome is established. Changed source, target, title or body cannot replace an unresolved intent. Existing different Release content is a conflict; authorized text-only changes use `notes-sync`.
+
+`notes-sync` shares source/tag identity checks and the release lock. Its verified updates refresh the publication journal's current body hash while preserving the original publication hash and change history. A notes update does not confer store acceptance. Pending notes operations block publication and vice versa.
+
+GitHub failure preserves Apple receipts and the original Build. The helper reports the GitHub blocker and can resume publication without another Apple write. Standard completion means formal App Review submission plus verified GitHub publication. Apple approval and public App Store availability remain separate results.

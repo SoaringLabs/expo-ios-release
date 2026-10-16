@@ -109,6 +109,9 @@ def remote_notes(root, directory, manifest, channels, execute, runner, helpers):
     targets = []
     invariants = []
     checkpoints = json.loads(state_file.read_text()) if state_file.exists() else {}
+    github_helpers = helpers["github"]
+    if execute:
+        github_helpers.guard_writes(state_file.parent, allow="notes")
     if "asc" in channels or "testflight" in channels:
         if execute and (not checkpoints.get("version_id") or not checkpoints.get("apple_build", {}).get("id")):
             raise NotesError("Restore the exact Apple version/build checkpoint before notes writes")
@@ -184,30 +187,40 @@ def remote_notes(root, directory, manifest, channels, execute, runner, helpers):
                     lambda target=loc_id: next(r for r in beta() if r["id"] == target)["attributes"].get("whatsNew", ""),
                     ["asc", "builds", "test-notes", "update", "--localization-id", loc_id, "--whats-new", expected, "--output", "json"]))
     if "github" in channels:
-        origin = helpers["git"](root, "remote", "get-url", "origin")
-        match = re.fullmatch(r"(?:https://github\.com/|git@github\.com:)([^/]+/[^/]+?)(?:\.git)?", origin)
-        if not match:
-            raise NotesError("Verify the GitHub origin before syncing release notes")
-        repo = match[1]
-        push_origin = helpers["git"](root, "remote", "get-url", "--push", "origin")
-        push_match = re.fullmatch(r"(?:https://github\.com/|git@github\.com:)([^/]+/[^/]+?)(?:\.git)?", push_origin)
-        if not push_match or push_match[1] != repo:
-            raise NotesError("GitHub fetch/push destinations differ")
+        try:
+            repo = github_helpers.repository(root, helpers["git"])
+        except github_helpers.GitHubError as error:
+            raise NotesError(str(error)) from error
         tag = "v" + version
         remote_tags = helpers["git"](root, "ls-remote", "--exit-code", "origin", f"refs/tags/{tag}", f"refs/tags/{tag}^{{}}")
-        tags = dict(line.split()[::-1] for line in remote_tags.splitlines())
-        tag_source = tags.get(f"refs/tags/{tag}^{{}}", tags.get(f"refs/tags/{tag}"))
-        if tag_source != manifest["source_commit"]:
+        if github_helpers.tag_source(remote_tags, tag) != manifest["source_commit"]:
             raise NotesError("GitHub tag does not identify the released source")
+        publication_path = state_file.with_name("github.json")
+        publication = json.loads(publication_path.read_text()) if publication_path.exists() else None
+        if publication and (publication.get("intent", {}).get("repository", "").lower() != repo.lower() or
+                            publication["intent"].get("source_commit") != manifest["source_commit"] or
+                            publication["intent"].get("tag") != tag):
+            raise NotesError("GitHub publication journal differs from the notes target")
+        if publication:
+            client = github_helpers.Client(root, runner)
+            identity = client.preflight(write=execute)
+            observed = client.release(repo, tag)
+            if (publication["intent"].get("repository_id") not in (None, identity["repository_id"]) or
+                    not observed or publication.get("release_id") not in (None, observed["id"])):
+                raise NotesError("GitHub repository or Release ID changed from the publication journal")
+            invariants.append((lambda: client.release(repo, tag)["id"], observed["id"]))
+            invariants.append((lambda: client.preflight(write=False)["repository_id"], identity["repository_id"]))
+        invariants.append((lambda: github_helpers.tag_source(helpers["git"](root, "ls-remote", "--exit-code", "origin",
+            f"refs/tags/{tag}", f"refs/tags/{tag}^{{}}"), tag), manifest["source_commit"]))
         def github():
-            return call("gh", "release", "view", tag, "--repo", repo, "--json", "body,tagName,name,isDraft,isPrerelease")
+            return call("gh", "release", "view", tag, "--repo", "github.com/" + repo, "--json", "body,tagName,name,isDraft,isPrerelease")
         release = github()
         if release["tagName"] != tag or release["isDraft"] or release["isPrerelease"]:
             raise NotesError("Resolve the existing formal GitHub Release first")
         invariants.append((lambda: {k: v for k, v in github().items() if k != "body"},
                            {k: v for k, v in release.items() if k != "body"}))
         targets.append(("github:body", repo + ":" + tag, data["releaseNotes"], lambda: github()["body"],
-                        ["gh", "release", "edit", tag, "--repo", repo, "--notes-file", str(directory / "release-notes.md")]))
+                        ["gh", "release", "edit", tag, "--repo", "github.com/" + repo, "--notes-file", str(directory / "release-notes.md")]))
     for operation, target, expected, _, _ in targets:
         previous = journal["operations"].get(operation, {})
         if previous.get("status") == "pending" and (previous.get("body_sha256") != body_digest(expected) or previous.get("target") != target):
@@ -243,6 +256,12 @@ def remote_notes(root, directory, manifest, channels, execute, runner, helpers):
             journal["operations"][operation] = {"status": "verified", "target": target,
                                                 "body_sha256": desired_digest, "verified_at": now()}
             atomic_json(journal_path, journal)
+            if operation == "github:body" and publication:
+                previous_digest = publication["intent"].get("body_sha256")
+                if previous_digest != desired_digest:
+                    publication.setdefault("notes_history", []).append({"body_sha256": previous_digest, "updated_at": now()})
+                    publication["intent"]["body_sha256"] = desired_digest
+                    atomic_json(publication_path, publication)
         results.append({"channel": operation, "target": target, "matches": matched,
                         "body_sha256": desired_digest})
     return {"status": "verified" if all(r["matches"] for r in results) else "differences",

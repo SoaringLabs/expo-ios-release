@@ -63,3 +63,7 @@ Generated files are `metadata/version/VERSION/LOCALE.json`, `review-notes.txt`, 
 ## Existing releases
 
 The generic manifest is schema 2 and checkpoints live in `.git/expo-ios-release/VERSION/`. Product-specific manifests/checkpoints are not automatically migrated. Finish or resume them with their original helper, or explicitly migrate after checking exact source/build/version IDs and current remote state. Installing this skill preserves the old workflow.
+
+GitHub publication requires an authenticated `gh` with repository write access, one matching GitHub.com origin fetch/push destination and full paginated release history. It does not add `gh` to the existing EAS/ASC version-pin configuration or require it for Apple-only endpoints. The helper verifies the installed GitHub CLI contract by using its API and explicit publish flags.
+
+For an established Release title, optionally add `"github": {"title": "Example App v2.0.0"}` to that version's private schema-2 manifest before publication. Otherwise the title uses the source commit's static Expo app name, or the repository name, followed by `vVERSION`. Dynamic Expo config is not evaluated from a later HEAD during backfill; the previously verified EAS source/build identity is reused. Title, repository identity, source, exact build/version IDs, body hash and publication flags are frozen in `github.json` before writes.
